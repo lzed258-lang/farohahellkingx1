@@ -321,6 +321,32 @@ async function handleMessage(api, event) {
     return;
   }
 
+  if (body === "ايقاف تيك" || body === "إيقاف تيك" || body === "تشغيل تيك") {
+    if (!isAdmin(senderID)) return;
+    const cmd = commands.get("تيك");
+    if (!cmd || typeof cmd.setEnabled !== "function") {
+      await api.sendMessage("❌ تعذر تحميل إعدادات أمر تيك.", threadID);
+      return;
+    }
+    const enabled = body === "تشغيل تيك";
+    cmd.setEnabled(api, event, enabled).catch(async (e) => {
+      console.error("[KAYDO] خطأ في تغيير حالة تيك:", e.message || e);
+      await api
+        .sendMessage("❌ لم أستطع حفظ حالة أمر تيك.", threadID)
+        .catch(() => {});
+    });
+    return;
+  }
+
+  if (body.startsWith("تيك ")) {
+    const cmd = commands.get("تيك");
+    if (cmd)
+      cmd
+        .execute(api, event)
+        .catch((e) => console.error("[KAYDO] خطأ في تيك:", e.message));
+    return;
+  }
+
   if (body === "kaydo" || body.startsWith("kaydo ")) {
     const cmd = commands.get("kaydo");
     if (cmd)
