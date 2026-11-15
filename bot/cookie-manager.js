@@ -7,8 +7,9 @@
 const fs = require('fs');
 const path = require('path');
 
-const SAVE_INTERVAL_MS = 5 * 60 * 1000; // حفظ دوري كل 5 دقائق
-const CHECK_INTERVAL_MS = 30 * 60 * 1000; // فحص حياة الجلسة كل 30 دقيقة
+let SAVE_INTERVAL_MS = 5 * 60 * 1000;
+let CHECK_INTERVAL_MS = 30 * 60 * 1000;
+let SAVE_DEBOUNCE_MS = 30 * 1000;
 const COOKIE_CHECK_URL = 'https://mbasic.facebook.com/settings';
 const USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36';
@@ -18,6 +19,8 @@ const backupPath = path.join(__dirname, 'appstate.backup.json');
 
 let saveTimer = null;
 let checkTimer = null;
+let debounceTimer = null;
+let pendingSave = false;
 let loginTime = null;
 let lastSaveAt = null;
 let lastCheckAt = null;
@@ -36,6 +39,7 @@ function writeAppStateAtomic(state) {
   } catch (e) {}
 }
 
+// حفظ فوري — يستخدم عند تسجيل الدخول أو الإغلاق فقط.
 function saveAppState(api, reason) {
   if (!api || typeof api.getAppState !== 'function') return false;
   try {
@@ -49,6 +53,22 @@ function saveAppState(api, reason) {
     console.error('[KAYDO COOKIE] خطأ في حفظ الكوكيز:', e.message || e);
     return false;
   }
+}
+
+// حفظ مؤجل (debounce) — يجمع عمليات الحفظ المتكررة في عملية واحدة.
+// GoatBot-Pro sessionGuard يستخدم debounce بنفس الفكرة لتفادي كتابة
+// الملف في كل تغيير صغير، ما يقلل تلف الكوكيز ويطيل عمرها.
+function saveAppStateDebounced(api, reason) {
+  if (!api || typeof api.getAppState !== 'function') return;
+  pendingSave = true;
+  if (debounceTimer) clearTimeout(debounceTimer);
+  debounceTimer = setTimeout(() => {
+    debounceTimer = null;
+    if (pendingSave && currentApi) {
+      pendingSave = false;
+      saveAppState(currentApi, reason || 'حفظ مؤجل');
+    }
+  }, SAVE_DEBOUNCE_MS);
 }
 
 function restoreBackupIfMainMissing() {
@@ -127,12 +147,23 @@ function startCookieManager(api, options) {
   onExpireCallback =
     options && typeof options.onExpire === 'function' ? options.onExpire : null;
 
+  // اقرأ الإعدادات من connection-config.json إن وُجدت
+  try {
+    const cfg = require('./connection-config.json');
+    if (cfg.cookieManager) {
+      if (cfg.cookieManager.saveIntervalMs) SAVE_INTERVAL_MS = cfg.cookieManager.saveIntervalMs;
+      if (cfg.cookieManager.checkIntervalMs) CHECK_INTERVAL_MS = cfg.cookieManager.checkIntervalMs;
+      if (cfg.cookieManager.saveDebounceMs) SAVE_DEBOUNCE_MS = cfg.cookieManager.saveDebounceMs;
+    }
+  } catch (e) {}
+
   restoreBackupIfMainMissing();
 
   if (saveTimer) clearInterval(saveTimer);
   if (checkTimer) clearInterval(checkTimer);
 
-  saveTimer = setInterval(() => saveAppState(currentApi, 'حفظ دوري'), SAVE_INTERVAL_MS);
+  // الحفظ الدوري يستخدم النسخة المؤجلة لتفادي الكتابة المتكررة
+  saveTimer = setInterval(() => saveAppStateDebounced(currentApi, 'حفظ دوري'), SAVE_INTERVAL_MS);
 
   checkTimer = setInterval(runSessionCheck, CHECK_INTERVAL_MS);
 
@@ -149,6 +180,15 @@ function stopCookieManager() {
   if (checkTimer) {
     clearInterval(checkTimer);
     checkTimer = null;
+  }
+  // حفظ أخير فوري قبل الإيقاف
+  if (debounceTimer) {
+    clearTimeout(debounceTimer);
+    debounceTimer = null;
+  }
+  if (pendingSave && currentApi) {
+    pendingSave = false;
+    saveAppState(currentApi, 'إيقاف المدير');
   }
   currentApi = null;
   onExpireCallback = null;
@@ -181,4 +221,4 @@ function getCookieStatus() {
   };
 }
 
-module.exports = { startCookieManager, stopCookieManager, saveAppState, getCookieStatus, restoreBackupIfMainMissing, isCookieAlive, USER_AGENT };
+module.exports = { startCookieManager, stopCookieManager, saveAppState, saveAppStateDebounced, getCookieStatus, restoreBackupIfMainMissing, isCookieAlive, USER_AGENT };

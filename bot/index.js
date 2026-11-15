@@ -1,13 +1,46 @@
 // ─── kaydo — محرك البوت: لا يفصل أبداً ولا يفقد الكوكيز ───
-// أهم درس من GoatBot-Pro: أخطاء الاتصال المؤقتة (MQTT/شبكة) لا تستدعي
-// إعادة تسجيل دخول — لأن تكرار الدخول من نفس الآي بي هو ما يفتعل حظر
-// الكوكيز. إعادة الدخول فقط عند موت الجلسة فعلاً (فحص mbasic).
+// تقنيات مدمجة من GoatBot-Pro:
+// 1) محدد معدل إعادة التشغيل — يمنع الحظر المتسلسل من إعادة الدخول السريعة.
+// 2) keep-alive ذاتي — يمنع الاستضافات المجانية من إيقاف البوت.
+// 3) إعادة تشغيل مجدولة — تنعش الاتصال قبل أن يموت من قِبل الخادم.
+// 4) أخطاء الاتصال المؤقتة (MQTT/شبكة) لا تستدعي إعادة تسجيل دخول.
 let botApi = null;
 let msgEmitter = null;
 let isRestarting = false;
 let reconnectAttempts = 0;
 let heartbeatInterval = null;
 let sessionExpired = false;
+let autoRestartTimer = null;
+
+// ─── إعدادات الاتصال من connection-config.json ───
+let connConfig = {};
+try {
+  connConfig = require('./connection-config.json');
+} catch (e) {
+  console.log('[KAYDO] ⚠️ connection-config.json غير موجود — استخدام الإعدادات الافتراضية');
+}
+
+const RESTART_WINDOW_MS = connConfig.restartRateLimit?.windowMs || 10 * 60 * 1000;
+const MAX_RESTARTS_PER_WINDOW = connConfig.restartRateLimit?.maxRestarts || 5;
+const BASE_BACKOFF_MS = connConfig.restartRateLimit?.baseBackoffMs || 5000;
+const MAX_BACKOFF_MS = connConfig.restartRateLimit?.maxBackoffMs || 5 * 60 * 1000;
+const HEARTBEAT_INTERVAL_MS = connConfig.heartbeat?.intervalMs || 30000;
+const MEMORY_SWEEPER_MS = connConfig.memorySweeper?.intervalMs || 10 * 60 * 1000;
+
+// ─── تتبع معدل إعادة التشغيل (تقنية GoatBot-Pro الرئيسية) ───
+// GoatBot-Pro يوقف إعادة التشغيل بعد محاولات كثيرة في وقت قصير،
+// لأن تكرار الدخول من نفس IP هو ما يرفع درجة الخطر ويفتعل حظر الكوكيز.
+let restartTimes = [];
+
+function canRestart() {
+  const now = Date.now();
+  restartTimes = restartTimes.filter((t) => now - t < RESTART_WINDOW_MS);
+  return restartTimes.length < MAX_RESTARTS_PER_WINDOW;
+}
+
+function recordRestart() {
+  restartTimes.push(Date.now());
+}
 
 process.on('uncaughtException', (err) => {
   console.error('[KAYDO] 🔴 خطأ غير متوقع:', err && err.message ? err.message : String(err));
@@ -28,6 +61,16 @@ process.on('SIGHUP', () => {
   console.log('[KAYDO] ⚠️ استلمت SIGHUP — البوت يتجاهلها ويكمل');
 });
 
+// ─── حفظ الكوكيز قبل الخروج القسري ───
+process.on('SIGINT', () => {
+  console.log('[KAYDO] ⚠️ استلمت SIGINT — حفظ الكوكيز ثم خروج');
+  try {
+    const { saveAppState } = require('./cookie-manager');
+    if (botApi) saveAppState(botApi, 'خروج SIGINT');
+  } catch (e) {}
+  process.exit(0);
+});
+
 const fs = require('fs');
 const path = require('path');
 const express = require('express');
@@ -41,11 +84,11 @@ const {
   restoreBackupIfMainMissing,
   USER_AGENT,
 } = require('./cookie-manager');
+const { startKeepAlive, stopKeepAlive } = require('./keep-alive');
 
 const PORT = process.env.PORT || 3000;
 const app = express();
 
-// UserAgent ثابت لكل الاتصالات — تغيّر الجهاز المفاجئ هو ما يطلق حماية فيسبوك
 process.env.UA = USER_AGENT;
 
 app.get('/', (req, res) => {
@@ -56,12 +99,21 @@ app.get('/', (req, res) => {
     uptime: Math.floor(process.uptime()) + ' ثانية',
     reconnectAttempts,
     sessionExpired,
+    restartsInWindow: restartTimes.length,
     cookies: getCookieStatus(),
     timestamp: new Date().toISOString(),
   });
 });
 
 app.get('/ping', (req, res) => res.send('pong - kaydo حي ويعمل'));
+
+app.get('/health', (req, res) => {
+  res.status(200).json({
+    status: botApi ? 'ok' : 'reconnecting',
+    uptime: process.uptime(),
+    timestamp: Date.now(),
+  });
+});
 
 app.get('/cookies', (req, res) => {
   res.json(getCookieStatus());
@@ -96,9 +148,27 @@ app.post('/updatecookies', express.json(), (req, res) => {
   }
 });
 
-app.listen(PORT, () => {
+const uptimeServer = app.listen(PORT, '0.0.0.0', () => {
   console.log(`[KAYDO] 🌐 خادم Uptime يعمل على المنفذ ${PORT}`);
 });
+
+uptimeServer.on('error', (err) => {
+  if (err.code === 'EADDRINUSE')
+    console.log(`[KAYDO] ⚠️ المنفذ ${PORT} مستخدم — خادم Uptime معطل`);
+  else
+    console.error('[KAYDO] 🔴 خطأ خادم Uptime:', err.message);
+});
+
+// ─── keep-alive ذاتي (تقنية GoatBot-Pro) ───
+// يمنع الاستضافات المجانية من إيقاف البوت بسبب الخمول.
+try {
+  const keepAliveConfig = connConfig.keepAlive || { enable: true, intervalMs: 180000 };
+  if (keepAliveConfig.enable !== false) {
+    uptimeServer.on('listening', () => startKeepAlive(keepAliveConfig));
+  }
+} catch (e) {
+  console.error('[KAYDO] keep-alive لم يبدأ:', e.message);
+}
 
 // ─── Heartbeat كل 30 ثانية ───
 function startHeartbeat(api) {
@@ -112,7 +182,7 @@ function startHeartbeat(api) {
     } catch (e) {
       console.error('[KAYDO] ⚠️ Heartbeat failed:', e.message);
     }
-  }, 30000);
+  }, HEARTBEAT_INTERVAL_MS);
 }
 
 // ─── تنظيف الذاكرة كل 10 دقائق ───
@@ -122,21 +192,51 @@ function startMemorySweeper(api) {
       if (api && api._msgQueue && Array.isArray(api._msgQueue)) api._msgQueue = [];
       if (api && api._messageCache) {
         const keys = Object.keys(api._messageCache);
-        if (keys.length > 50) keys.slice(0, keys.length - 50).forEach(k => delete api._messageCache[k]);
+        if (keys.length > 50) keys.slice(0, keys.length - 50).forEach((k) => delete api._messageCache[k]);
       }
       if (api && api._threadCache) {
         const keys = Object.keys(api._threadCache);
-        if (keys.length > 20) keys.slice(0, keys.length - 20).forEach(k => delete api._threadCache[k]);
+        if (keys.length > 20) keys.slice(0, keys.length - 20).forEach((k) => delete api._threadCache[k]);
       }
       if (typeof global.gc === 'function') global.gc();
       console.log('[KAYDO] 🟢 تنظيف الذاكرة');
     } catch (e) {}
-  }, 10 * 60 * 1000);
+  }, MEMORY_SWEEPER_MS);
+}
+
+// ─── إعادة تشغيل مجدولة (تقنية GoatBot-Pro autoRestart) ───
+// تنعش الاتصال بشكل استباقي قبل أن يكتشف خادم فيسبوك خمول الجلسة.
+function scheduleAutoRestart() {
+  if (autoRestartTimer) clearTimeout(autoRestartTimer);
+  const autoRestartConfig = connConfig.autoRestart;
+  if (!autoRestartConfig || autoRestartConfig.enable === false) return;
+  const interval = autoRestartConfig.intervalMs || 60 * 60 * 1000;
+  autoRestartTimer = setTimeout(() => {
+    console.log(`[KAYDO] 🔄 إعادة تشغيل مجدولة بعد ${Math.round(interval / 60000)} دقيقة — تنعيش الاتصال`);
+    // حفظ الكوكيز قبل إعادة التشغيل
+    if (botApi) saveAppState(botApi, 'إعادة تشغيل مجدولة');
+    scheduleRestart(2000);
+  }, interval);
+  console.log(`[KAYDO] ⏰ إعادة تشغيل مجدولة بعد ${Math.round(interval / 60000)} دقيقة`);
 }
 
 // ─── المحرك الرئيسي ───
 function startBot() {
   if (isRestarting) return;
+
+  // ─── فحص معدل إعادة التشغيل (تقنية GoatBot-Pro) ───
+  if (!canRestart()) {
+    console.error(
+      `[KAYDO] 🔴 تم رفض إعادة التشغيل: ${restartTimes.length} محاولات في آخر ${RESTART_WINDOW_MS / 60000} دقيقة. ` +
+        'فيسبوك على الأرجح يحظر الجلسة — حدّث الكوكيز ثم أعد تشغيل البوت يدوياً.',
+    );
+    // انتظر طويلاً ثم أعد المحاولة — لا نتوقف للأبد
+    setTimeout(() => {
+      restartTimes = [];
+      startBot();
+    }, 30 * 60 * 1000);
+    return;
+  }
 
   restoreBackupIfMainMissing();
 
@@ -170,7 +270,6 @@ function startBot() {
       autoReconnect: true,
       online: true,
       userAgent: USER_AGENT,
-      // لا يعيد تسجيل الدخول تلقائياً عند أي خطأ — نقرر نحن متى نعيد
       autoLogin: false,
     },
     (err, api) => {
@@ -181,16 +280,22 @@ function startBot() {
 
         if (errMsg.includes('retrieving userID') || errMsg.includes('blocked') || errMsg.includes('unknown location') || errMsg.includes('checkpoint')) {
           console.log('[KAYDO] 🔴 checkpoint أو حظر — إعادة بعد 5 دقائق (بدون تكرار سريع حتى لا يزداد الحظر)');
+          recordRestart();
           isRestarting = false;
           setTimeout(startBot, 5 * 60 * 1000);
           return;
         }
 
+        recordRestart();
         reconnectAttempts++;
-        const delay = Math.min(15000 * reconnectAttempts, 120000);
-        console.log(`[KAYDO] ⏳ إعادة بعد ${delay / 1000}ث (محاولة ${reconnectAttempts})`);
+        // backoff أسي مع حد أقصى (تقنية GoatBot-Pro)
+        const backoff = Math.min(
+          BASE_BACKOFF_MS * Math.pow(2, reconnectAttempts - 1),
+          MAX_BACKOFF_MS,
+        );
+        console.log(`[KAYDO] ⏳ إعادة بعد ${Math.round(backoff / 1000)}ث (محاولة ${reconnectAttempts})`);
         isRestarting = false;
-        setTimeout(startBot, delay);
+        setTimeout(startBot, backoff);
         return;
       }
 
@@ -200,7 +305,6 @@ function startBot() {
       sessionExpired = false;
       botApi = api;
 
-      // حفظ فوري وآمن للكوكيز المحدثة
       saveAppState(api, 'بعد تسجيل الدخول');
 
       const ctx = api.ctx;
@@ -215,11 +319,13 @@ function startBot() {
       startMemorySweeper(api);
       startCookieManager(api, {
         onExpire: () => {
-          // موت الجلسة فقط هو ما يستدعي إعادة دخول كاملة
           sessionExpired = true;
           scheduleRestart(5000);
         },
       });
+
+      // جدولة إعادة التشغيل الاستباقية
+      scheduleAutoRestart();
 
       try {
         const qasf = commands.get('قصف');
@@ -229,7 +335,7 @@ function startBot() {
       }
 
       console.log('[KAYDO] 🤖 بوت "kaydo" يعمل — لا يفصل أبداً');
-    }
+    },
   );
 }
 
@@ -242,7 +348,6 @@ async function startListening(api) {
         const errMsg = String(err.message || err.error || err);
 
         // درس GoatBot-Pro: انقطاع MQTT المؤقت ليس موت جلسة.
-        // إعادة الدخول الكاملة هنا هي ما يفتعل حظر الكوكيز.
         if (
           errMsg.includes('Connection refused') ||
           errMsg.includes('Server unavailable') ||
@@ -296,19 +401,27 @@ function scheduleRestart(delay) {
   isRestarting = true;
 
   try { if (heartbeatInterval) { clearInterval(heartbeatInterval); heartbeatInterval = null; } } catch (e) {}
+  try { if (autoRestartTimer) { clearTimeout(autoRestartTimer); autoRestartTimer = null; } } catch (e) {}
   try { if (msgEmitter && typeof msgEmitter.stop === 'function') msgEmitter.stop(); } catch (e) {}
   try {
     const pin = commands.get('تثبيت');
     if (pin && pin.stopAll) pin.stopAll();
   } catch (e) {}
   try { stopCookieManager(); } catch (e) {}
+  try { stopKeepAlive(); } catch (e) {}
+
+  // حفظ الكوكيز قبل إعادة الاتصال
+  if (botApi) {
+    try { saveAppState(botApi, 'قبل إعادة الاتصال'); } catch (e) {}
+  }
 
   msgEmitter = null;
   botApi = null;
 
+  recordRestart();
   reconnectAttempts++;
-  const actualDelay = Math.min(delay * Math.max(reconnectAttempts, 1), 120000);
-  console.log(`[KAYDO] ⏳ إعادة الاتصال بعد ${actualDelay / 1000}ث (محاولة ${reconnectAttempts})`);
+  const actualDelay = Math.min(delay * Math.max(reconnectAttempts, 1), MAX_BACKOFF_MS);
+  console.log(`[KAYDO] ⏳ إعادة الاتصال بعد ${Math.round(actualDelay / 1000)}ث (محاولة ${reconnectAttempts})`);
 
   setTimeout(() => {
     isRestarting = false;
